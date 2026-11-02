@@ -33,7 +33,7 @@ _start:
   mov x7, #FIXTURE_WINDOW_SIZE
   cmp x6, x7
   b.ne failed
-  ldr x6, [x0, #0x478]
+  ldr x6, [x0, #0x2d8]
   cmp x6, x7
   b.ne failed
   add x7, x5, x7

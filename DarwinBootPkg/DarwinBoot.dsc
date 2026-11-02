@@ -31,4 +31,3 @@
 
 [Components]
   DarwinBootPkg/Driver/DarwinBoot.inf
-  Test/Validation.inf

@@ -1,8 +1,8 @@
 ## SPDX-License-Identifier: BSD-2-Clause-Patent
 [Defines]
   INF_VERSION = 0x00010019
-  BASE_NAME = DarwinBoot
-  FILE_GUID = 1B64AF87-8415-4B57-9B16-680D70913B9F
+  BASE_NAME = DarwinBoot24
+  FILE_GUID = D6112048-454F-4629-870F-7FCA045E4422
   MODULE_TYPE = UEFI_DRIVER
   VERSION_STRING = 0.1
   ENTRY_POINT = DarwinBootEntry
@@ -10,6 +10,7 @@
 [Sources]
   DarwinBoot.c
   PackedRamdisk.h
+  UsbOwnership.h
   BootArgs.h
   BootVideo.h
   DiagFont.h
@@ -34,6 +35,7 @@
   gEfiSimpleFileSystemProtocolGuid ## CONSUMES
   gEfiLoadedImageProtocolGuid ## CONSUMES
   gEfiGraphicsOutputProtocolGuid ## CONSUMES
+  gEfiUsbFunctionIoProtocolGuid ## CONSUMES
 
 [Guids]
   gEfiFileInfoGuid

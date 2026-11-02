@@ -38,8 +38,25 @@ typedef struct {
 } KERNEL;
 
 STATIC EFI_HANDLE  mImage;
+STATIC EFI_HANDLE  mReplacedHandle;
+STATIC VOID        *mReplacedLoader;
 UINT64 EFIAPI DarwinCurrentEl (VOID);
-VOID EFIAPI DarwinEnter (UINT64 Args, UINT64 Entry, UINT64 Memory, UINT64 Size, UINT64 VideoBase, UINT64 VideoBytes);
+VOID EFIAPI DarwinEnter (UINT64 Args, UINT64 Entry, UINT64 Memory, UINT64 PopulatedBytes, UINT64 VideoBase, UINT64 VideoBytes);
+VOID EFIAPI DarwinEnterEnd (VOID);
+
+STATIC
+VOID
+FlushRange (UINT64 Base, UINT64 Bytes)
+{
+  UINT64 Ctr, Line, Address;
+  __asm__ volatile ("mrs %0, ctr_el0" : "=r" (Ctr));
+  Line = 4ULL << ((Ctr >> 16) & 15);
+  __asm__ volatile ("dsb sy" ::: "memory");
+  for (Address = Base & ~(Line - 1); Address < Base + Bytes; Address += Line) {
+    __asm__ volatile ("dc civac, %0" :: "r" (Address) : "memory");
+  }
+  __asm__ volatile ("dsb sy" ::: "memory");
+}
 
 #define READ_SYSREG(Name)  ({ UINT64 Value_; __asm__ volatile ("mrs %0, " #Name : "=r" (Value_)); Value_; })
 
@@ -92,7 +109,6 @@ ReadFile (
   Status = File->GetInfo (File, &gEfiFileInfoGuid, &InfoSize, Info);
   if (EFI_ERROR (Status)) { goto Done; }
   if ((Info->Attribute & EFI_FILE_DIRECTORY) || (Info->FileSize == 0) || (Info->FileSize > Limit)) {
-    Print (L"DARWINBOOT: %s attr %lx size %lu limit %lu\n", Path, (UINT64)Info->Attribute, (UINT64)Info->FileSize, (UINT64)Limit);
     Status = EFI_BAD_BUFFER_SIZE;
     goto Done;
   }
@@ -111,7 +127,7 @@ Done:
 
 STATIC
 EFI_STATUS
-ParseKernelHeader (CONST UINT8 *Data, UINTN Size, UINTN Header, KERNEL *Kernel)
+ParseKernel (CONST UINT8 *Data, UINTN Size, KERNEL *Kernel)
 {
   UINTN    Offset;
   UINTN    End;
@@ -124,19 +140,15 @@ ParseKernelHeader (CONST UINT8 *Data, UINTN Size, UINTN Header, KERNEL *Kernel)
   BOOLEAN  HasEntry;
   BOOLEAN  Executable;
 
-  if ((Header > Size) || (Size - Header < 32) ||
-      (U32 (Data + Header) != 0xfeedfacf) || (U32 (Data + Header + 4) != 0x100000c) ||
-      (((U32 (Data + Header + 8) & 0x00ffffff) != 0) &&
-       ((U32 (Data + Header + 8) & 0x00ffffff) != 2)) ||
-      ((U32 (Data + Header + 12) != 2) &&
-       ((Header != 0) || (U32 (Data + Header + 12) != 12)))) {
+  if ((Size < 32) || (U32 (Data) != 0xfeedfacf) || (U32 (Data + 4) != 0x100000c) ||
+      (U32 (Data + 8) != 0) || (U32 (Data + 12) != 2)) {
     return EFI_UNSUPPORTED;
   }
-  if (U32 (Data + Header + 20) > Size - Header - 32) { return EFI_LOAD_ERROR; }
+  if (U32 (Data + 20) > Size - 32) { return EFI_LOAD_ERROR; }
   ZeroMem (Kernel, sizeof (*Kernel));
-  Count = U32 (Data + Header + 16);
-  End = Header + 32 + U32 (Data + Header + 20);
-  Offset = Header + 32;
+  Count = U32 (Data + 16);
+  End = 32 + U32 (Data + 20);
+  Offset = 32;
   HasEntry = FALSE;
   for (Index = 0; Index < Count; Index++) {
     if (End - Offset < 8) { return EFI_LOAD_ERROR; }
@@ -185,89 +197,16 @@ ParseKernelHeader (CONST UINT8 *Data, UINTN Size, UINTN Header, KERNEL *Kernel)
   return EFI_SUCCESS;
 }
 
-// Fileset segment offsets are absolute in the collection. XNU rebases and
-// signs its own fixup chains after entry; firmware only copies root mappings.
-STATIC
-EFI_STATUS
-ParseKernel (CONST UINT8 *Data, UINTN Size, KERNEL *Kernel)
-{
-  EFI_STATUS Status;
-  KERNEL     Member;
-  UINTN      Offset;
-  UINTN      End;
-  UINTN      Header;
-  UINTN      Name;
-  UINTN      Index;
-  UINTN      Other;
-  UINT32     Length;
-  BOOLEAN    Found;
-  BOOLEAN    Covered;
-  SEGMENT    *Child;
-  SEGMENT    *Parent;
-
-  Status = ParseKernelHeader (Data, Size, 0, Kernel);
-  if (EFI_ERROR (Status) || (U32 (Data + 12) != 12)) { return Status; }
-  Offset = 32;
-  End = 32 + U32 (Data + 20);
-  Found = FALSE;
-  while (Offset < End) {
-    Length = U32 (Data + Offset + 4);
-    if (U32 (Data + Offset) == 0x80000035) {
-      if (Length < 40) { return EFI_LOAD_ERROR; }
-      Name = U32 (Data + Offset + 24);
-      if ((Name < 32) || (Name >= Length)) { return EFI_LOAD_ERROR; }
-      for (Index = Name; (Index < Length) && (Data[Offset + Index] != 0); Index++) {}
-      if (Index == Length) { return EFI_LOAD_ERROR; }
-      Header = U64 (Data + Offset + 16);
-      if ((Header > Size) || (Size - Header < 32) || (Header & 7)) { return EFI_LOAD_ERROR; }
-      // Every indexed header must actually be loaded at its advertised VA.
-      Covered = FALSE;
-      for (Other = 0; Other < Kernel->Count; Other++) {
-        Parent = &Kernel->Segments[Other];
-        if ((Header >= Parent->FileOffset) &&
-            (Header - Parent->FileOffset <= Parent->FileSize) &&
-            (32 <= Parent->FileSize - (Header - Parent->FileOffset)) &&
-            (U64 (Data + Offset + 8) == Parent->Address + Header - Parent->FileOffset)) {
-          Covered = TRUE;
-        }
-      }
-      if (!Covered) { return EFI_LOAD_ERROR; }
-      if ((Index - Name == sizeof ("com.apple.kernel") - 1) &&
-          (CompareMem (Data + Offset + Name, "com.apple.kernel", sizeof ("com.apple.kernel")) == 0)) {
-        if (Found || (U32 (Data + Header + 12) != 2) ||
-            (U32 (Data + Header + 8) != U32 (Data + 8)) ||
-            ((U32 (Data + Header + 24) & 0x80000000) == 0)) { return EFI_LOAD_ERROR; }
-        Found = TRUE;
-        Status = ParseKernelHeader (Data, Size, Header, &Member);
-        if (EFI_ERROR (Status) || (Member.Entry != Kernel->Entry)) { return EFI_LOAD_ERROR; }
-        for (Index = 0; Index < Member.Count; Index++) {
-          Child = &Member.Segments[Index];
-          Covered = FALSE;
-          for (Other = 0; Other < Kernel->Count; Other++) {
-            Parent = &Kernel->Segments[Other];
-            if ((Child->Address >= Parent->Address) &&
-                (Child->Address - Parent->Address <= Parent->Size) &&
-                (Child->Size <= Parent->Size - (Child->Address - Parent->Address)) &&
-                ((Child->Protection & ~Parent->Protection) == 0) &&
-                ((Child->FileSize == 0) ||
-                 ((Child->Address - Parent->Address <= Parent->FileSize) &&
-                  (Child->FileSize <= Parent->FileSize - (Child->Address - Parent->Address)) &&
-                  (Child->FileOffset == Parent->FileOffset + Child->Address - Parent->Address)))) {
-              Covered = TRUE;
-            }
-          }
-          if (!Covered) { return EFI_LOAD_ERROR; }
-        }
-      }
-    }
-    Offset += Length;
-  }
-  return Found ? EFI_SUCCESS : EFI_LOAD_ERROR;
-}
+STATIC UINTN mAudioDmaOffset = MAX_UINTN;
+#include "UsbOwnership.h"
+#define PONG_RAM_MAX 64
+#define PONG_RAM_WIRE_SIZE (32 + PONG_RAM_MAX * 16)
+STATIC UINTN mRamWireOffset = MAX_UINTN, mRamAllowedOffset = MAX_UINTN, mRamAllowedCount;
+typedef struct { UINT64 Start, Size; } PONG_RAM_BANK;
 
 STATIC
 BOOLEAN
-AdtNode (CONST UINT8 *Data, UINTN Size, UINTN *Offset, UINTN Depth, UINTN ParentPath, UINTN *RamdiskOffset, UINTN *TrustCacheOffset, UINTN *AddonOffset, UINTN *PolicyOffset, UINT64 *WindowSize, BOOLEAN *KeepPacked)
+AdtNode (CONST UINT8 *Data, UINTN Size, UINTN *Offset, UINTN Depth, UINTN ParentPath, UINTN *RamdiskOffset, UINTN *TrustCacheOffset, UINT64 *WindowSize, BOOLEAN *KeepPacked)
 {
   UINT32 Properties;
   UINT32 Children;
@@ -276,9 +215,8 @@ AdtNode (CONST UINT8 *Data, UINTN Size, UINTN *Offset, UINTN Depth, UINTN Parent
   UINTN  Path;
   UINTN  Candidate;
   UINTN  TrustCandidate;
-  UINTN  AddonCandidate;
-  UINTN  PolicyCandidate;
   UINTN  MemoryCandidate;
+  UINTN  AudioCandidate, RamCandidate, AllowedCandidate, AllowedCount;
   CONST UINT8 *Name;
   UINTN  NameLength;
 
@@ -286,9 +224,9 @@ AdtNode (CONST UINT8 *Data, UINTN Size, UINTN *Offset, UINTN Depth, UINTN Parent
   NameLength = 0;
   Candidate = MAX_UINTN;
   TrustCandidate = MAX_UINTN;
-  AddonCandidate = MAX_UINTN;
-  PolicyCandidate = MAX_UINTN;
   MemoryCandidate = MAX_UINTN;
+  AudioCandidate = MAX_UINTN;
+  RamCandidate = AllowedCandidate = MAX_UINTN; AllowedCount = 0;
   if ((Depth > 64) || (Size - *Offset < 8)) { return FALSE; }
   Properties = U32 (Data + *Offset);
   Children = U32 (Data + *Offset + 4);
@@ -314,17 +252,22 @@ AdtNode (CONST UINT8 *Data, UINTN Size, UINTN *Offset, UINTN Depth, UINTN Parent
       if ((Candidate != MAX_UINTN) || (Length != 16)) { return FALSE; }
       Candidate = *Offset;
     }
+    if (AsciiStrCmp ((CONST CHAR8 *)(Data + *Offset - 36), "darwinboot-memory-ranges") == 0) {
+      if ((mRamWireOffset != MAX_UINTN) || (RamCandidate != MAX_UINTN) || (Length != PONG_RAM_WIRE_SIZE)) { return FALSE; }
+      RamCandidate = *Offset;
+    }
+    if (AsciiStrCmp ((CONST CHAR8 *)(Data + *Offset - 36), "pong-allocatable-ram") == 0) {
+      if ((mRamAllowedOffset != MAX_UINTN) || (AllowedCandidate != MAX_UINTN) || !Length || Length % 16 || Length / 16 > PONG_RAM_MAX) { return FALSE; }
+      AllowedCandidate = *Offset;
+      AllowedCount = Length / 16;
+    }
+    if (AsciiStrCmp ((CONST CHAR8 *)(Data + *Offset - 36), "pong-audio-dma") == 0) {
+      if ((AudioCandidate != MAX_UINTN) || (Length != 16)) { return FALSE; }
+      AudioCandidate = *Offset;
+    }
     if (AsciiStrCmp ((CONST CHAR8 *)(Data + *Offset - 36), "TrustCache") == 0) {
       if ((TrustCandidate != MAX_UINTN) || (Length != 16)) { return FALSE; }
       TrustCandidate = *Offset;
-    }
-    if (AsciiStrCmp ((CONST CHAR8 *)(Data + *Offset - 36), "GpuAddon") == 0) {
-      if ((AddonCandidate != MAX_UINTN) || (Length != 16)) { return FALSE; }
-      AddonCandidate = *Offset;
-    }
-    if (AsciiStrCmp ((CONST CHAR8 *)(Data + *Offset - 36), "RootPolicies") == 0) {
-      if ((PolicyCandidate != MAX_UINTN) || (Length != 16)) { return FALSE; }
-      PolicyCandidate = *Offset;
     }
     if (AsciiStrCmp ((CONST CHAR8 *)(Data + *Offset - 36), "darwinboot-memory-size") == 0) {
       if ((MemoryCandidate != MAX_UINTN) || (Length != 8)) { return FALSE; }
@@ -346,13 +289,13 @@ AdtNode (CONST UINT8 *Data, UINTN Size, UINTN *Offset, UINTN Depth, UINTN Parent
     if (*TrustCacheOffset != MAX_UINTN) { return FALSE; }
     *TrustCacheOffset = TrustCandidate;
   }
-  if ((Path == 2) && (AddonCandidate != MAX_UINTN)) {
-    if (*AddonOffset != MAX_UINTN) { return FALSE; }
-    *AddonOffset = AddonCandidate;
+  if (AudioCandidate != MAX_UINTN) {
+    if ((Path != 1) || (mAudioDmaOffset != MAX_UINTN)) { return FALSE; }
+    mAudioDmaOffset = AudioCandidate;
   }
-  if (PolicyCandidate != MAX_UINTN) {
-    if ((Path != 2) || (*PolicyOffset != MAX_UINTN)) { return FALSE; }
-    *PolicyOffset = PolicyCandidate;
+  if (RamCandidate != MAX_UINTN || AllowedCandidate != MAX_UINTN) {
+    if (Path != 1 || RamCandidate == MAX_UINTN || AllowedCandidate == MAX_UINTN) { return FALSE; }
+    mRamWireOffset = RamCandidate; mRamAllowedOffset = AllowedCandidate; mRamAllowedCount = AllowedCount;
   }
   if (MemoryCandidate != MAX_UINTN) {
     if ((Path != 1) || (*WindowSize != 0)) { return FALSE; }
@@ -361,7 +304,7 @@ AdtNode (CONST UINT8 *Data, UINTN Size, UINTN *Offset, UINTN Depth, UINTN Parent
   }
   if (Children > (Size - *Offset) / 8) { return FALSE; }
   for (Index = 0; Index < Children; Index++) {
-    if (!AdtNode (Data, Size, Offset, Depth + 1, Path, RamdiskOffset, TrustCacheOffset, AddonOffset, PolicyOffset, WindowSize, KeepPacked)) { return FALSE; }
+    if (!AdtNode (Data, Size, Offset, Depth + 1, Path, RamdiskOffset, TrustCacheOffset, WindowSize, KeepPacked)) { return FALSE; }
   }
   return TRUE;
 }
@@ -448,17 +391,13 @@ STATIC CONST UINT64 mDiagFont[] = GLYPH_FONT;
 
 STATIC
 VOID
-DiagDraw (CONST CHAR16 *Text, UINTN Row)
+DiagDrawVideo (CONST CHAR16 *Text, UINTN Row, CONST UINT64 Video[6])
 {
-  EFI_GRAPHICS_OUTPUT_PROTOCOL *Gop;
-  UINT64                       Video[6];
   UINTN                        Scale = 4, X = 0, Y, Index, Gx, Gy, Dx, Dy, Cell, Line;
   UINT32                       *Fb;
   UINT64                       Glyph, Data;
   CHAR16                       Ch;
 
-  if (EFI_ERROR (gBS->LocateProtocol (&gEfiGraphicsOutputProtocolGuid, NULL, (VOID **)&Gop)) ||
-      EFI_ERROR (DarwinBootVideoFromGop (Gop, Video))) { return; }
   Cell = 6 * Scale;
   Line = 14 * Scale;
   Y = Video[4] / 4 + Row * Line;
@@ -488,6 +427,25 @@ DiagDraw (CONST CHAR16 *Text, UINTN Row)
     }
     X += Cell;
   }
+  FlushRange (Video[0], Video[2] * Video[4]);
+}
+
+STATIC
+VOID
+DiagDraw (CONST CHAR16 *Text, UINTN Row)
+{
+  UINT64 Video[6];
+  if (!EFI_ERROR (ReadBootVideo (Video)) && Video[0]) { DiagDrawVideo (Text, Row, Video); }
+}
+
+STATIC
+VOID
+HandoffStage (CONST UINT64 Video[6], CONST CHAR16 *Text, UINT64 Status)
+{
+  CHAR16 Line[80];
+  if (!Video[0]) { return; }
+  UnicodeSPrint (Line, sizeof (Line), L"HANDOFF %s %016lx", Text, Status);
+  DiagDrawVideo (Line, 14, Video);
 }
 
 STATIC
@@ -546,6 +504,103 @@ AllocateWindow (KERNEL *Kernel, UINT64 WindowSize, EFI_PHYSICAL_ADDRESS *Address
   return Status;
 }
 
+// Claim currently free pages, after all image allocations are complete. The primary
+// contiguous window remains unchanged: additional DRAM is passed as separate banks.
+STATIC
+EFI_STATUS
+ClaimPongRam (CONST UINT8 *Tree, EFI_MEMORY_DESCRIPTOR *Map, UINTN MapSize, UINTN Stride,
+              PONG_RAM_BANK *Owned, UINTN *Count, CONST UINT64 Video[6])
+{
+  UINTN Offset, I, J;
+  UINT64 PoolStart = 0, PoolEnd = 0, Largest = 0;
+  UINTN Skipped = 0;
+  EFI_STATUS Status;
+  if (mRamWireOffset == MAX_UINTN || mRamAllowedOffset == MAX_UINTN) { return EFI_SUCCESS; }
+  // Validate the complete contract before taking ownership of any pages.
+  if (Stride < sizeof (EFI_MEMORY_DESCRIPTOR) || !Stride || MapSize % Stride) { return EFI_COMPROMISED_DATA; }
+  for (I = 0; I < mRamAllowedCount; I++) {
+    UINT64 Base = U64 (Tree + mRamAllowedOffset + I * 16);
+    UINT64 Bytes = U64 (Tree + mRamAllowedOffset + I * 16 + 8);
+    if (!Bytes || Base > MAX_UINT64 - Bytes || ((Base | Bytes) & EFI_PAGE_MASK)) { return EFI_COMPROMISED_DATA; }
+    for (J = 0; J < I; J++) {
+      UINT64 Other = U64 (Tree + mRamAllowedOffset + J * 16);
+      UINT64 OtherBytes = U64 (Tree + mRamAllowedOffset + J * 16 + 8);
+      if (Base < Other + OtherBytes && Other < Base + Bytes) { return EFI_COMPROMISED_DATA; }
+    }
+  }
+  // The qualified FD's DXE heap is below 4 GiB. Do not drain that heap or
+  // repurpose low device/uncached aliases while firmware drivers still run.
+  // Keep an additional high-memory pool too: final map/pool allocations may
+  // be made by firmware callbacks before ExitBootServices has completed.
+  for (Offset = 0; Offset + Stride <= MapSize; Offset += Stride) {
+    EFI_MEMORY_DESCRIPTOR *D = (EFI_MEMORY_DESCRIPTOR *)((UINT8 *)Map + Offset);
+    if (D->Type != EfiConventionalMemory || !(D->Attribute & EFI_MEMORY_WB) ||
+        !D->NumberOfPages || D->NumberOfPages > (MAX_UINT64 - D->PhysicalStart) / EFI_PAGE_SIZE) { continue; }
+    for (I = 0; I < mRamAllowedCount; I++) {
+      UINT64 Base = U64 (Tree + mRamAllowedOffset + I * 16);
+      UINT64 Bytes = U64 (Tree + mRamAllowedOffset + I * 16 + 8);
+      UINT64 Start = MAX (MAX (Base, D->PhysicalStart), 0x100000000ULL);
+      UINT64 Stop = MIN (Base + Bytes, D->PhysicalStart + EFI_PAGES_TO_SIZE (D->NumberOfPages));
+      if (Stop > Start && Stop - Start > Largest) { Largest = Stop - Start; PoolEnd = Stop; }
+    }
+  }
+  if (Largest > SIZE_256MB) { PoolStart = PoolEnd - SIZE_256MB; }
+  else { return EFI_SUCCESS; } // no expendable large bank; retain the primary window
+  for (Offset = 0; Offset + Stride <= MapSize; Offset += Stride) {
+    EFI_MEMORY_DESCRIPTOR *D = (EFI_MEMORY_DESCRIPTOR *)((UINT8 *)Map + Offset);
+    UINT64 End;
+    if (D->Type != EfiConventionalMemory || !(D->Attribute & EFI_MEMORY_WB) || !D->NumberOfPages ||
+        D->NumberOfPages > (MAX_UINT64 - D->PhysicalStart) / EFI_PAGE_SIZE) { continue; }
+    End = D->PhysicalStart + EFI_PAGES_TO_SIZE (D->NumberOfPages);
+    for (I = 0; I < mRamAllowedCount; I++) {
+      UINT64 Base = U64 (Tree + mRamAllowedOffset + I * 16);
+      UINT64 Bytes = U64 (Tree + mRamAllowedOffset + I * 16 + 8);
+      UINT64 Start, Stop;
+      Start = MAX (MAX (Base, D->PhysicalStart), 0x100000000ULL); Stop = MIN (Base + Bytes, End);
+      if (Start >= Stop) { continue; }
+      if (Start < PoolEnd && PoolStart < Stop) { Stop = PoolStart; }
+      if (Start >= Stop) { continue; }
+      // The video allocation is never general RAM, even if faulty firmware calls it free.
+      if (Video[0] && Video[2] && Video[4]) {
+        UINT64 Fb = Video[0] & ~(UINT64)EFI_PAGE_MASK;
+        UINT64 FbEnd = ALIGN_VALUE (Video[0] + Video[2] * Video[4], EFI_PAGE_SIZE);
+        if (Start < FbEnd && Fb < Stop) { continue; }
+      }
+      while (Start < Stop) {
+        UINT64 Address = Start, BytesNow = MIN (Stop - Start, SIZE_1GB);
+        if (*Count >= PONG_RAM_MAX) { Skipped++; break; }
+        Status = gBS->AllocatePages (AllocateAddress, EfiLoaderData, EFI_SIZE_TO_PAGES (BytesNow), &Address);
+        if (EFI_ERROR (Status)) { Skipped++; break; }
+        // Coalesce adjacent leases without changing the primary bank. Keep
+        // firmware calls bounded even when one descriptor exceeds 4 GiB.
+        if (*Count > 1 && Owned[*Count - 1].Start + Owned[*Count - 1].Size == Address) {
+          Owned[*Count - 1].Size += BytesNow;
+        } else { Owned[(*Count)++] = (PONG_RAM_BANK){Address, BytesNow}; }
+        Start += BytesNow;
+      }
+    }
+  }
+  if (Skipped) { Print (L"DARWINBOOT24: %u additional RAM ranges left with firmware\n", (UINT32)Skipped); }
+  return EFI_SUCCESS;
+}
+STATIC
+UINT64
+WritePongRam (UINT64 TreeAddress, PONG_RAM_BANK *Owned, UINTN Count)
+{
+  UINT64 Total = 0;
+  UINT8 *Wire = (UINT8 *)(UINTN)(TreeAddress + mRamWireOffset);
+  ZeroMem (Wire, PONG_RAM_WIRE_SIZE);
+  WriteUnaligned64 ((UINT64 *)Wire, 1);
+  WriteUnaligned64 ((UINT64 *)(Wire + 8), Count);
+  for (UINTN I = 0; I < Count; I++) {
+    WriteUnaligned64 ((UINT64 *)(Wire + 32 + I * 16), Owned[I].Start);
+    WriteUnaligned64 ((UINT64 *)(Wire + 40 + I * 16), Owned[I].Size);
+    Total += Owned[I].Size;
+  }
+  WriteUnaligned64 ((UINT64 *)(Wire + 16), Total);
+  return Total;
+}
+
 STATIC
 EFI_STATUS
 EFIAPI
@@ -560,17 +615,17 @@ Boot (
   VOID                            *Image;
   VOID                            *Tree;
   VOID                            *TrustCaches;
-  VOID                            *Addon;
   UINTN                           ImageSize;
   UINTN                           TreeSize;
   UINTN                           TrustCacheSize;
-  UINTN                           AddonSize;
   CHAR16                          *TreePath;
   UINTN                           Length;
   UINTN                           Index;
   UINTN                           Offset;
   KERNEL                          Kernel;
   EFI_PHYSICAL_ADDRESS            Address;
+  EFI_PHYSICAL_ADDRESS            AudioAddress = 0;
+  EFI_PHYSICAL_ADDRESS            UsbAddress = 0;
   UINT64                          ArgsAddress;
   UINT64                          TreeAddress;
   UINT64                          Used;
@@ -583,12 +638,9 @@ Boot (
   BOOLEAN                         KeepPacked;
   UINTN                           TrustCacheOffset;
   UINT64                          TrustCacheAddress;
-  UINTN                           AddonOffset;
-  UINT64                          AddonAddress;
-  VOID                            *Policies;
-  UINTN                           PolicySize;
-  UINTN                           PolicyOffset;
-  UINT64                          PolicyAddress;
+  UINT64                          TrampolineAddress;
+  UINTN                           TrampolineBytes;
+  VOID (EFIAPI *Enter)(UINT64, UINT64, UINT64, UINT64, UINT64, UINT64);
   DARWIN_BOOT_ARGS                *Args;
   EFI_MEMORY_DESCRIPTOR           *Map;
   UINTN                           Capacity;
@@ -597,27 +649,28 @@ Boot (
   UINTN                           Stride;
   UINT32                          Version;
   UINTN                           Attempt;
-  CHAR8                           CommandLine[1024];
+  CHAR8                           CommandLine[DARWIN_BOOT_LINE_LENGTH];
   UINT64                          Video[6];
+  PONG_RAM_BANK                   Owned[PONG_RAM_MAX];
+  UINTN                           OwnedCount = 0;
+  CONST CHAR16                    *Stage = L"REQUEST";
+  CHAR16                          Failure[96];
 
   (VOID)This;
   if ((Request == NULL) || (Request->Volume == NULL) || (Request->KernelPath == NULL)) { return EFI_INVALID_PARAMETER; }
+  DiagDraw (L"DARWINBOOT24 REQUEST", 0);
   if ((Request->KextCount != 0) || (Request->DeviceTree != NULL) || (Request->DeviceTreeSize != 0) ||
       (DarwinCurrentEl () != 4)) {
     Print (L"DARWINBOOT: unsupported inputs or exception level; firmware retained\n");
     return EFI_UNSUPPORTED;
   }
   if (!RamdiskLayout (Request->Ramdisk, Request->RamdiskSize, &RamdiskExpandedSize, &RamdiskPacked)) {
-    Print (L"DARWINBOOT: ramdisk layout rejected, %lu bytes\n", (UINT64)Request->RamdiskSize);
     return EFI_BAD_BUFFER_SIZE;
   }
   ZeroMem (CommandLine, sizeof (CommandLine));
   if (Request->BootArgs != NULL) {
     for (Index = 0; Request->BootArgs[Index] != 0; Index++) {
-      if ((Index >= sizeof (CommandLine) - 1) || (Request->BootArgs[Index] > 0x7f)) {
-        Print (L"DARWINBOOT: boot args rejected at %lu\n", (UINT64)Index);
-        return EFI_BAD_BUFFER_SIZE;
-      }
+      if ((Index >= sizeof (CommandLine) - 1) || (Request->BootArgs[Index] > 0x7f)) { return EFI_BAD_BUFFER_SIZE; }
       CommandLine[Index] = (CHAR8)Request->BootArgs[Index];
     }
   }
@@ -625,10 +678,6 @@ Boot (
   Image = NULL;
   Tree = NULL;
   TrustCaches = NULL;
-  Addon = NULL;
-  AddonSize = 0;
-  Policies = NULL;
-  PolicySize = 0;
   TreePath = NULL;
   Map = NULL;
   Address = 0;
@@ -637,8 +686,11 @@ Boot (
   if (EFI_ERROR (Status)) { return Status; }
   Status = Fs->OpenVolume (Fs, &Root);
   if (EFI_ERROR (Status)) { return Status; }
+  Stage = L"READ KERNEL";
+  DiagDraw (Stage, 0);
   Status = ReadFile (Root, Request->KernelPath, SIZE_128MB, &Image, &ImageSize);
   if (EFI_ERROR (Status)) { goto Fail; }
+  Stage = L"PARSE KERNEL";
   Status = ParseKernel (Image, ImageSize, &Kernel);
   if (EFI_ERROR (Status)) { goto Fail; }
   Length = StrSize (Request->KernelPath);
@@ -646,16 +698,20 @@ Boot (
   if (TreePath == NULL) { Status = EFI_OUT_OF_RESOURCES; goto Fail; }
   CopyMem (TreePath, Request->KernelPath, Length);
   StrCatS (TreePath, Length / sizeof (CHAR16) + 11, L".adt");
+  Stage = L"READ ADT";
   Status = ReadFile (Root, TreePath, SIZE_16MB, &Tree, &TreeSize);
   if (EFI_ERROR (Status)) { goto Fail; }
+  AddUsbSlots (&Tree, &TreeSize);
   Offset = 0;
   RamdiskOffset = MAX_UINTN;
   TrustCacheOffset = MAX_UINTN;
-  AddonOffset = MAX_UINTN;
-  PolicyOffset = MAX_UINTN;
+  mAudioDmaOffset = MAX_UINTN;
+  mRamWireOffset = mRamAllowedOffset = MAX_UINTN;
+  mRamAllowedCount = 0;
   WindowSize = 0;
   KeepPacked = FALSE;
-  if (!AdtNode (Tree, TreeSize, &Offset, 0, 3, &RamdiskOffset, &TrustCacheOffset, &AddonOffset, &PolicyOffset, &WindowSize, &KeepPacked) || (Offset != TreeSize)) { Status = EFI_COMPROMISED_DATA; goto Fail; }
+  Stage = L"PARSE ADT";
+  if (!AdtNode (Tree, TreeSize, &Offset, 0, 3, &RamdiskOffset, &TrustCacheOffset, &WindowSize, &KeepPacked) || (Offset != TreeSize)) { Status = EFI_COMPROMISED_DATA; goto Fail; }
   if (KeepPacked && (!RamdiskPacked || (RamdiskOffset == MAX_UINTN))) { Status = EFI_COMPROMISED_DATA; goto Fail; }
   if (WindowSize == 0) { WindowSize = WINDOW_SIZE; }
   if (Kernel.Base > MAX_UINT64 - WindowSize) { Status = EFI_LOAD_ERROR; goto Fail; }
@@ -668,6 +724,7 @@ Boot (
   }
   CopyMem (TreePath, Request->KernelPath, Length);
   StrCatS (TreePath, Length / sizeof (CHAR16) + 11, L".trustcache");
+  Stage = L"READ TRUSTCACHE";
   Status = ReadFile (Root, TreePath, SIZE_16MB, &TrustCaches, &TrustCacheSize);
   if (EFI_ERROR (Status) && (Status != EFI_NOT_FOUND)) { goto Fail; }
   if (TrustCaches != NULL) {
@@ -680,61 +737,50 @@ Boot (
     Status = EFI_COMPROMISED_DATA;
     goto Fail;
   }
-  //
-  // The GPU addon (kernel.macho.gpuaddon, scripts/make-gpu-addon.py): files the kernel writes into the Data volume before its addon
-  // mounts. Only its header is checked here; the kernel validates every entry.
-  //
-  CopyMem (TreePath, Request->KernelPath, Length);
-  StrCatS (TreePath, Length / sizeof (CHAR16) + 11, L".gpuaddon");
-  Status = ReadFile (Root, TreePath, SIZE_64MB, &Addon, &AddonSize);
-  if (EFI_ERROR (Status) && (Status != EFI_NOT_FOUND)) { goto Fail; }
-  if (Addon != NULL) {
-    if ((AddonOffset == MAX_UINTN) || (U64 ((UINT8 *)Tree + AddonOffset) != 0) || (U64 ((UINT8 *)Tree + AddonOffset + 8) != 0) ||
-        (AddonSize < 24) || (CompareMem (Addon, "NGPUADD2", 8) != 0) || (U64 ((UINT8 *)Addon + 16) != AddonSize)) {
-      Status = EFI_COMPROMISED_DATA;
-      goto Fail;
-    }
-  } else if (AddonOffset != MAX_UINTN) {
-    Status = EFI_COMPROMISED_DATA;
-    goto Fail;
-  }
-  // Root hash tables live outside the kernel's coalesced constant segments.
-  // The kernel authenticates each envelope against its compiled owner anchor.
-  CopyMem (TreePath, Request->KernelPath, Length);
-  StrCatS (TreePath, Length / sizeof (CHAR16) + 11, L".vroot");
-  Status = ReadFile (Root, TreePath, SIZE_128MB, &Policies, &PolicySize);
-  if (EFI_ERROR (Status) && (Status != EFI_NOT_FOUND)) { goto Fail; }
-  if (Policies != NULL) {
-    if ((PolicyOffset == MAX_UINTN) || (U64 ((UINT8 *)Tree + PolicyOffset) != 0) ||
-        (U64 ((UINT8 *)Tree + PolicyOffset + 8) != 0) || (PolicySize < 32) ||
-        (CompareMem (Policies, "VROOTB01", 8) != 0) || (U64 ((UINT8 *)Policies + 8) != 1) ||
-        (U64 ((UINT8 *)Policies + 16) == 0) || (U64 ((UINT8 *)Policies + 16) > 16) ||
-        (U64 ((UINT8 *)Policies + 24) != PolicySize)) {
-      Status = EFI_COMPROMISED_DATA;
-      goto Fail;
-    }
-  } else if (PolicyOffset != MAX_UINTN) {
-    Status = EFI_COMPROMISED_DATA;
-    goto Fail;
-  }
   Status = ReadBootVideo (Video);
   if (EFI_ERROR (Status)) { goto Fail; }
+  Stage = L"PRIMARY RAM";
+  DiagDrawVideo (Stage, 0, Video);
   Status = AllocateWindow (&Kernel, WindowSize, &Address);
   if (EFI_ERROR (Status)) { goto Fail; }
+  // Reserve real conventional low RAM for the DSP's 32-bit period buffer.
+  // This allocation follows the owned XNU window, so they cannot overlap.
+  // Never borrow a hard-coded Android carveout or an arbitrary low address.
+  if (mAudioDmaOffset != MAX_UINTN) {
+    AudioAddress = 0xffffffffULL;
+    Status = gBS->AllocatePages (AllocateMaxAddress, EfiReservedMemoryType, 16, &AudioAddress);
+    if (EFI_ERROR (Status)) { AudioAddress = 0; }
+    else {
+      ZeroMem ((VOID *)(UINTN)AudioAddress, 65536);
+      FlushRange (AudioAddress, 65536);
+    }
+  }
   ArgsAddress = ALIGN_VALUE (Address + Kernel.End - Kernel.Base, SIZE_16KB);
+  if (mUsbDmaOffset != MAX_UINTN) {
+    UsbAddress=0xffffffffULL;
+    Status=gBS->AllocatePages(AllocateMaxAddress,EfiReservedMemoryType,8,&UsbAddress);
+    if(EFI_ERROR(Status))UsbAddress=0;
+    else {ZeroMem((VOID *)(UINTN)UsbAddress,32768);FlushRange(UsbAddress,32768);}
+  }
   TreeAddress = ArgsAddress + EFI_PAGE_SIZE;
   RamdiskAddress = ALIGN_VALUE (TreeAddress + TreeSize, EFI_PAGE_SIZE);
   RamdiskBytes = ALIGN_VALUE (KeepPacked ? Request->RamdiskSize : RamdiskExpandedSize, EFI_PAGE_SIZE);
   TrustCacheAddress = RamdiskAddress + RamdiskBytes;
-  AddonAddress = ALIGN_VALUE (TrustCacheAddress + TrustCacheSize, SIZE_16KB);
-  PolicyAddress = ALIGN_VALUE (AddonAddress + AddonSize, SIZE_16KB);
-  Used = ALIGN_VALUE (PolicyAddress + PolicySize, SIZE_16KB) - Address;
-  if (Used > WindowSize - BLOCK_SIZE) {
-    Print (L"DARWINBOOT: used %lu window %lu kernel %lu ramdisk %lu\n", (UINT64)Used, (UINT64)WindowSize, (UINT64)(Kernel.End - Kernel.Base), (UINT64)RamdiskBytes);
-    Status = EFI_BAD_BUFFER_SIZE;
-    goto Fail;
-  }
+  Used = ALIGN_VALUE (TrustCacheAddress + TrustCacheSize, SIZE_16KB) - Address;
+  TrampolineAddress = Address + Used;
+  TrampolineBytes = (UINTN)DarwinEnterEnd - (UINTN)DarwinEnter;
+  if ((TrampolineBytes == 0) || (TrampolineBytes > EFI_PAGE_SIZE)) { Status = EFI_LOAD_ERROR; goto Fail; }
+  Used += EFI_PAGE_SIZE;
+  if (Used > WindowSize - BLOCK_SIZE) { Status = EFI_BAD_BUFFER_SIZE; goto Fail; }
+  Stage = L"COPY PAYLOAD";
+  DiagDrawVideo (Stage, 0, Video);
   ZeroMem ((VOID *)(UINTN)Address, (UINTN)Used);
+  // The MMU-off transition must run inside the identity-mapped owned window,
+  // independently of the firmware's dynamically loaded PE image placement.
+  CopyMem ((VOID *)(UINTN)TrampolineAddress, (VOID *)(UINTN)DarwinEnter, TrampolineBytes);
+  FlushRange (TrampolineAddress, TrampolineBytes);
+  __asm__ volatile ("ic iallu\n\tdsb sy\n\tisb" ::: "memory");
+  Enter = (VOID (EFIAPI *)(UINT64, UINT64, UINT64, UINT64, UINT64, UINT64))(UINTN)TrampolineAddress;
   for (Index = 0; Index < Kernel.Count; Index++) {
     CopyMem ((VOID *)(UINTN)(Address + Kernel.Segments[Index].Address - Kernel.Base),
              (UINT8 *)Image + Kernel.Segments[Index].FileOffset, (UINTN)Kernel.Segments[Index].FileSize);
@@ -752,6 +798,14 @@ Boot (
   Args->DeviceTreeLength = (UINT32)TreeSize;
   CopyMem (Args->CommandLine, CommandLine, sizeof (CommandLine));
   CopyMem ((VOID *)(UINTN)TreeAddress, Tree, TreeSize);
+  if (mAudioDmaOffset != MAX_UINTN) {
+    WriteUnaligned64 ((UINT64 *)(UINTN)(TreeAddress + mAudioDmaOffset), AudioAddress);
+    WriteUnaligned64 ((UINT64 *)(UINTN)(TreeAddress + mAudioDmaOffset + 8), AudioAddress ? 65536 : 0);
+  }
+  if (mUsbDmaOffset != MAX_UINTN) {
+    WriteUnaligned64((UINT64 *)(UINTN)(TreeAddress+mUsbDmaOffset),UsbAddress);
+    WriteUnaligned64((UINT64 *)(UINTN)(TreeAddress+mUsbDmaOffset+8),UsbAddress?32768:0);
+  }
   if (Request->Ramdisk != NULL) {
     if (KeepPacked) { CopyMem ((VOID *)(UINTN)RamdiskAddress, Request->Ramdisk, Request->RamdiskSize); }
     else { CopyRamdisk ((VOID *)(UINTN)RamdiskAddress, Request->Ramdisk, Request->RamdiskSize, RamdiskPacked); }
@@ -764,30 +818,41 @@ Boot (
     WriteUnaligned64 ((UINT64 *)(UINTN)(TreeAddress + TrustCacheOffset + 8), TrustCacheSize);
     FreePool (TrustCaches); TrustCaches = NULL;
   }
-  if (Addon != NULL) {
-    CopyMem ((VOID *)(UINTN)AddonAddress, Addon, AddonSize);
-    WriteUnaligned64 ((UINT64 *)(UINTN)(TreeAddress + AddonOffset), AddonAddress);
-    WriteUnaligned64 ((UINT64 *)(UINTN)(TreeAddress + AddonOffset + 8), AddonSize);
-    FreePool (Addon); Addon = NULL;
-  }
-  if (Policies != NULL) {
-    CopyMem ((VOID *)(UINTN)PolicyAddress, Policies, PolicySize);
-    WriteUnaligned64 ((UINT64 *)(UINTN)(TreeAddress + PolicyOffset), PolicyAddress);
-    WriteUnaligned64 ((UINT64 *)(UINTN)(TreeAddress + PolicyOffset + 8), PolicySize);
-    FreePool (Policies); Policies = NULL;
-  }
   FreePool (Image); Image = NULL;
   FreePool (Tree); Tree = NULL;
   FreePool (TreePath); TreePath = NULL;
   Root->Close (Root); Root = NULL;
+  Stage = L"MEMORY MAP";
   Status = GetMap (&Map, &Capacity, &MapSize, &Key, &Stride);
   if (EFI_ERROR (Status)) { goto Fail; }
+  if (mRamWireOffset != MAX_UINTN && AsciiStrStr (CommandLine, "pong_ram_banks=0") == NULL) {
+    Stage = L"EXTRA RAM";
+    DiagDrawVideo (Stage, 0, Video);
+    Owned[0] = (PONG_RAM_BANK){Address, WindowSize}; OwnedCount = 1;
+    Status = ClaimPongRam ((CONST UINT8 *)(UINTN)TreeAddress, Map, MapSize, Stride, Owned, &OwnedCount, Video);
+    if (EFI_ERROR (Status)) {
+      // Contract validation precedes all extra allocations. A malformed
+      // optional bank description must not reject the known primary boot.
+      Print (L"DARWINBOOT24: extra RAM SKIP %r; primary window retained\n", Status);
+      OwnedCount = 1;
+    }
+    Args->MemorySizeActual = WritePongRam (TreeAddress, Owned, OwnedCount);
+    Print (L"DARWINBOOT24: %u owned RAM banks, %lu MiB usable before kernel reservations\n",
+           (UINT32)OwnedCount, Args->MemorySizeActual >> 20);
+    // Claiming free descriptors can split the map. Leave room before ExitBootServices.
+    Status = GetMap (&Map, &Capacity, &MapSize, &Key, &Stride);
+    if (EFI_ERROR (Status)) { goto Fail; }
+  }
+  Stage = L"READY TO ENTER";
+  DiagDrawVideo (Stage, 0, Video);
   Print (L"DARWINBOOT: ARM64 va=0x%lx pa=0x%lx args=0x%lx entry=0x%lx owned=0x%lx\n",
          Kernel.Base, Address, ArgsAddress, Address + Kernel.Entry - Kernel.Base, (UINT64)WindowSize);
   Print (L"DARWINBOOT: video base=0x%lx display=%lu row=%lu width=%lu height=%lu depth=%lu\n",
          Video[0], Video[1], Video[2], Video[3], Video[4], Video[5]);
-  Print (L"DARWINBOOT: command line: %a\n", CommandLine);
+  Print (L"DARWINBOOT24: command line: %a\n", CommandLine);
   Print (L"DARWINBOOT: inputs validated; exiting boot services\n");
+  Print (L"DARWINBOOT24: boot_args size 0x%lx, command line %u bytes\n",
+         (UINT64)sizeof (*Args), (UINT32)sizeof (Args->CommandLine));
 
   //
   // The same facts in large type over the whole screen. The firmware's log
@@ -808,17 +873,31 @@ Boot (
   DEBUG ((DEBUG_ERROR, "ID_AA64MMFR0_EL1 0x%lx  (PARange %lu, 4 KiB granule %a)\n", READ_SYSREG (id_aa64mmfr0_el1),
           READ_SYSREG (id_aa64mmfr0_el1) & 0xF, (((READ_SYSREG (id_aa64mmfr0_el1) >> 28) & 0xF) == 0xF) ? "NOT supported" : "supported"));
   DEBUG ((DEBUG_ERROR, "ID_AA64PFR0_EL1  0x%lx\n", READ_SYSREG (id_aa64pfr0_el1)));
-  DEBUG ((DEBUG_ERROR, "\nExiting boot services. A green bar across the top\nmarks the loader handoff before the kernel branch.\n"));
+  DEBUG ((DEBUG_ERROR, "owned trampoline pa 0x%lx (%lu bytes)\n", TrampolineAddress, (UINT64)TrampolineBytes));
+  DEBUG ((DEBUG_ERROR, "\nExiting boot services. A green bar means the loader\ntrampoline ran; payload entry is not yet confirmed.\n"));
+  if(UsbRequested(CommandLine)) {
+    DiagDrawVideo(L"USB FIRMWARE RELEASE",0,Video);
+    QuiesceUsb(TreeAddress,UsbAddress);
+  }
+  Status=GetMap(&Map,&Capacity,&MapSize,&Key,&Stride);
+  if(EFI_ERROR(Status))goto Fail;
   for (Attempt = 0; Attempt < 3; Attempt++) {
     MapSize = Capacity;
     Status = gBS->GetMemoryMap (&MapSize, Map, &Key, &Stride, &Version);
     if (EFI_ERROR (Status)) {
+      HandoffStage (Video, L"GETMAP ERROR", Status);
       if (Attempt == 0) { goto Fail; }
       CpuDeadLoop ();
     }
+    HandoffStage (Video, L"EXIT CALL", Attempt);
     Status = gBS->ExitBootServices (mImage, Key);
+    HandoffStage (Video, L"EXIT RETURN", Status);
     if (!EFI_ERROR (Status)) {
-      DarwinEnter (ArgsAddress, Address + Kernel.Entry - Kernel.Base, Address, WindowSize, Video[0], Video[2] * Video[4]);
+      // All writes by this loader are in [Address, Address + Used): Mach-O
+      // segments/BSS, args, ADT, initrd, trustcache and copied trampoline.
+      // Untouched free pages are not boot input. Clean only populated data,
+      // while boot_args still advertises the complete owned window/banks.
+      Enter (ArgsAddress, Address + Kernel.Entry - Kernel.Base, Address, Used, Video[0], Video[2] * Video[4]);
       CpuDeadLoop ();
     }
     if (Status != EFI_INVALID_PARAMETER) { CpuDeadLoop (); }
@@ -826,14 +905,22 @@ Boot (
   CpuDeadLoop ();
   return EFI_ABORTED;
 Fail:
+  if(mUsbStopped && mUsbFunction!=NULL && mUsbFunction->StartController!=NULL) {
+    (VOID)mUsbFunction->StartController(mUsbFunction);mUsbStopped=FALSE;
+  }
+  UnicodeSPrint (Failure, sizeof (Failure), L"BOOT FAILED %s %016lx", Stage, Status);
+  DiagDraw (Failure, 0);
   if (Root != NULL) { Root->Close (Root); }
   if (Image != NULL) { FreePool (Image); }
   if (Tree != NULL) { FreePool (Tree); }
   if (TrustCaches != NULL) { FreePool (TrustCaches); }
-  if (Addon != NULL) { FreePool (Addon); }
-  if (Policies != NULL) { FreePool (Policies); }
   if (TreePath != NULL) { FreePool (TreePath); }
   if (Map != NULL) { FreePool (Map); }
+  for (Index = 1; Index < OwnedCount; Index++) {
+    gBS->FreePages (Owned[Index].Start, EFI_SIZE_TO_PAGES (Owned[Index].Size));
+  }
+  if (AudioAddress != 0) { gBS->FreePages (AudioAddress, 16); }
+  if (UsbAddress != 0) { gBS->FreePages (UsbAddress, 8); }
   if (Address != 0) { gBS->FreePages (Address, EFI_SIZE_TO_PAGES (WindowSize)); }
   Print (L"DARWINBOOT: boot refused: %r; firmware retained\n", Status);
   return Status;
@@ -846,6 +933,9 @@ EFI_STATUS
 EFIAPI
 Unload (EFI_HANDLE ImageHandle)
 {
+  if (mReplacedHandle != NULL) {
+    return gBS->ReinstallProtocolInterface (mReplacedHandle, &gUniXNULoaderProtocolGuid, &mLoader, mReplacedLoader);
+  }
   return gBS->UninstallMultipleProtocolInterfaces (ImageHandle, &gUniXNULoaderProtocolGuid, &mLoader, NULL);
 }
 
@@ -856,17 +946,37 @@ DarwinBootEntry (EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable)
   EFI_LOADED_IMAGE_PROTOCOL *Loaded;
   EFI_STATUS               Status;
   VOID                     *Existing;
+  EFI_HANDLE               *Handles;
+  UINTN                    Count;
 
   (VOID)SystemTable;
-  Status = gBS->LocateProtocol (&gUniXNULoaderProtocolGuid, NULL, &Existing);
-  if (!EFI_ERROR (Status)) { return EFI_ALREADY_STARTED; }
   Status = gBS->HandleProtocol (ImageHandle, &gEfiLoadedImageProtocolGuid, (VOID **)&Loaded);
   if (EFI_ERROR (Status)) { return Status; }
+  Status = gBS->LocateProtocol (&gUniXNULoaderProtocolGuid, NULL, &Existing);
+  if (!EFI_ERROR (Status)) {
+    // Explicit, volatile replacement for the qualified FD's older loader.
+    // Unloading this driver restores it; no firmware or phone storage changes.
+    if (((UNIXNU_LOADER_PROTOCOL *)Existing)->Revision != UNIXNU_LOADER_REVISION) { return EFI_UNSUPPORTED; }
+    Status = gBS->LocateHandleBuffer (ByProtocol, &gUniXNULoaderProtocolGuid, NULL, &Count, &Handles);
+    if (EFI_ERROR (Status)) { return Status; }
+    if (Count != 1) { FreePool (Handles); return EFI_UNSUPPORTED; }
+    Status = gBS->ReinstallProtocolInterface (Handles[0], &gUniXNULoaderProtocolGuid, Existing, &mLoader);
+    if (!EFI_ERROR (Status)) {
+      mReplacedHandle = Handles[0];
+      mReplacedLoader = Existing;
+      mImage = ImageHandle;
+      Loaded->Unload = Unload;
+      Print (L"DARWINBOOT24: replaced loader in RAM; Darwin 24 ABI, EL%u\n", (UINT32)(DarwinCurrentEl () >> 2));
+    }
+    FreePool (Handles);
+    return Status;
+  }
+  if (Status != EFI_NOT_FOUND) { return Status; }
   mImage = ImageHandle;
   Status = gBS->InstallMultipleProtocolInterfaces (&ImageHandle, &gUniXNULoaderProtocolGuid, &mLoader, NULL);
   if (!EFI_ERROR (Status)) {
     Loaded->Unload = Unload;
-    Print (L"DARWINBOOT: loader v2 installed EL%u\n", (UINT32)(DarwinCurrentEl () >> 2));
+    Print (L"DARWINBOOT24: Darwin 24 loader installed EL%u\n", (UINT32)(DarwinCurrentEl () >> 2));
   }
   return Status;
 }

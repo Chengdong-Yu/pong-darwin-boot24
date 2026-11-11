@@ -35,6 +35,7 @@ typedef struct {
   UINT64   Base;
   UINT64   End;
   UINT64   Entry;
+  BOOLEAN  Arm64e;
 } KERNEL;
 
 STATIC EFI_HANDLE  mImage;
@@ -139,17 +140,26 @@ ParseKernel (CONST UINT8 *Data, UINTN Size, KERNEL *Kernel)
   SEGMENT  *Segment;
   BOOLEAN  HasEntry;
   BOOLEAN  Executable;
+  BOOLEAN  Fileset;
+  BOOLEAN  KernelEntry;
+  UINT32   Subtype;
 
-  if ((Size < 32) || (U32 (Data) != 0xfeedfacf) || (U32 (Data + 4) != 0x100000c) ||
-      (U32 (Data + 8) != 0) || (U32 (Data + 12) != 2)) {
+  if ((Size < 32) || (U32 (Data) != 0xfeedfacf) || (U32 (Data + 4) != 0x100000c)) {
+    return EFI_UNSUPPORTED;
+  }
+  Subtype = U32 (Data + 8) & 0x00ffffff;
+  Fileset = U32 (Data + 12) == 12;
+  if ((Subtype != 0 && Subtype != 2) || (U32 (Data + 12) != 2 && !Fileset)) {
     return EFI_UNSUPPORTED;
   }
   if (U32 (Data + 20) > Size - 32) { return EFI_LOAD_ERROR; }
   ZeroMem (Kernel, sizeof (*Kernel));
+  Kernel->Arm64e = Subtype == 2;
   Count = U32 (Data + 16);
   End = 32 + U32 (Data + 20);
   Offset = 32;
   HasEntry = FALSE;
+  KernelEntry = FALSE;
   for (Index = 0; Index < Count; Index++) {
     if (End - Offset < 8) { return EFI_LOAD_ERROR; }
     Command = U32 (Data + Offset);
@@ -169,6 +179,23 @@ ParseKernel (CONST UINT8 *Data, UINTN Size, KERNEL *Kernel)
             (Segment->FileSize > Segment->Size) || (Segment->FileOffset > Size) ||
             (Segment->FileSize > Size - Segment->FileOffset)) { return EFI_LOAD_ERROR; }
       }
+    } else if (Command == 0x80000035) {
+      UINT32 NameAt;
+      UINT64 HeaderAt;
+      if (!Fileset || Length < 32) { return EFI_LOAD_ERROR; }
+      NameAt = U32 (Data + Offset + 24);
+      HeaderAt = U64 (Data + Offset + 16);
+      if (NameAt < 32 || NameAt >= Length || HeaderAt > Size || Size - HeaderAt < 32) {
+        return EFI_LOAD_ERROR;
+      }
+      // Load the coalesced root segments exactly once. Entry headers are
+      // metadata for XNU, not separate independently relocated images.
+      if (Length - NameAt >= sizeof ("com.apple.kernel") &&
+          CompareMem (Data + Offset + NameAt, "com.apple.kernel", sizeof ("com.apple.kernel")) == 0) {
+        if (KernelEntry || U32 (Data + HeaderAt) != 0xfeedfacf ||
+            U32 (Data + HeaderAt + 4) != 0x100000c) { return EFI_LOAD_ERROR; }
+        KernelEntry = TRUE;
+      }
     } else if (Command == 5) {
       if (HasEntry || (Length != 288) || (U32 (Data + Offset + 8) != 6) ||
           (U32 (Data + Offset + 12) != 68)) { return EFI_LOAD_ERROR; }
@@ -177,7 +204,7 @@ ParseKernel (CONST UINT8 *Data, UINTN Size, KERNEL *Kernel)
     }
     Offset += Length;
   }
-  if ((Offset != End) || !HasEntry || (Kernel->Count == 0)) { return EFI_LOAD_ERROR; }
+  if ((Offset != End) || !HasEntry || (Fileset && !KernelEntry) || (Kernel->Count == 0)) { return EFI_LOAD_ERROR; }
   Kernel->Base = MAX_UINT64;
   Executable = FALSE;
   for (Index = 0; Index < Kernel->Count; Index++) {
@@ -198,6 +225,8 @@ ParseKernel (CONST UINT8 *Data, UINTN Size, KERNEL *Kernel)
 }
 
 STATIC UINTN mAudioDmaOffset = MAX_UINTN;
+STATIC UINTN mModemMetadataOffset = MAX_UINTN;
+STATIC UINTN mRmtfsDmaOffset = MAX_UINTN;
 #include "UsbOwnership.h"
 #define PONG_RAM_MAX 64
 #define PONG_RAM_WIRE_SIZE (32 + PONG_RAM_MAX * 16)
@@ -216,7 +245,7 @@ AdtNode (CONST UINT8 *Data, UINTN Size, UINTN *Offset, UINTN Depth, UINTN Parent
   UINTN  Candidate;
   UINTN  TrustCandidate;
   UINTN  MemoryCandidate;
-  UINTN  AudioCandidate, RamCandidate, AllowedCandidate, AllowedCount;
+  UINTN  AudioCandidate, ModemCandidate, RmtfsCandidate, RamCandidate, AllowedCandidate, AllowedCount;
   CONST UINT8 *Name;
   UINTN  NameLength;
 
@@ -226,6 +255,7 @@ AdtNode (CONST UINT8 *Data, UINTN Size, UINTN *Offset, UINTN Depth, UINTN Parent
   TrustCandidate = MAX_UINTN;
   MemoryCandidate = MAX_UINTN;
   AudioCandidate = MAX_UINTN;
+  ModemCandidate = RmtfsCandidate = MAX_UINTN;
   RamCandidate = AllowedCandidate = MAX_UINTN; AllowedCount = 0;
   if ((Depth > 64) || (Size - *Offset < 8)) { return FALSE; }
   Properties = U32 (Data + *Offset);
@@ -265,6 +295,14 @@ AdtNode (CONST UINT8 *Data, UINTN Size, UINTN *Offset, UINTN Depth, UINTN Parent
       if ((AudioCandidate != MAX_UINTN) || (Length != 16)) { return FALSE; }
       AudioCandidate = *Offset;
     }
+    if (AsciiStrCmp ((CONST CHAR8 *)(Data + *Offset - 36), "pong-rmtfs-dma") == 0) {
+      if ((RmtfsCandidate != MAX_UINTN) || (Length != 16)) { return FALSE; }
+      RmtfsCandidate = *Offset;
+    }
+    if (AsciiStrCmp ((CONST CHAR8 *)(Data + *Offset - 36), "pong-modem-metadata") == 0) {
+      if ((ModemCandidate != MAX_UINTN) || (Length != 16)) { return FALSE; }
+      ModemCandidate = *Offset;
+    }
     if (AsciiStrCmp ((CONST CHAR8 *)(Data + *Offset - 36), "TrustCache") == 0) {
       if ((TrustCandidate != MAX_UINTN) || (Length != 16)) { return FALSE; }
       TrustCandidate = *Offset;
@@ -292,6 +330,14 @@ AdtNode (CONST UINT8 *Data, UINTN Size, UINTN *Offset, UINTN Depth, UINTN Parent
   if (AudioCandidate != MAX_UINTN) {
     if ((Path != 1) || (mAudioDmaOffset != MAX_UINTN)) { return FALSE; }
     mAudioDmaOffset = AudioCandidate;
+  }
+  if (RmtfsCandidate != MAX_UINTN) {
+    if ((Path != 1) || (mRmtfsDmaOffset != MAX_UINTN)) { return FALSE; }
+    mRmtfsDmaOffset = RmtfsCandidate;
+  }
+  if (ModemCandidate != MAX_UINTN) {
+    if ((Path != 1) || (mModemMetadataOffset != MAX_UINTN)) { return FALSE; }
+    mModemMetadataOffset = ModemCandidate;
   }
   if (RamCandidate != MAX_UINTN || AllowedCandidate != MAX_UINTN) {
     if (Path != 1 || RamCandidate == MAX_UINTN || AllowedCandidate == MAX_UINTN) { return FALSE; }
@@ -625,6 +671,8 @@ Boot (
   KERNEL                          Kernel;
   EFI_PHYSICAL_ADDRESS            Address;
   EFI_PHYSICAL_ADDRESS            AudioAddress = 0;
+  EFI_PHYSICAL_ADDRESS            ModemMetadataAddress = 0;
+  EFI_PHYSICAL_ADDRESS            RmtfsAddress = 0;
   EFI_PHYSICAL_ADDRESS            UsbAddress = 0;
   UINT64                          ArgsAddress;
   UINT64                          TreeAddress;
@@ -693,6 +741,14 @@ Boot (
   Stage = L"PARSE KERNEL";
   Status = ParseKernel (Image, ImageSize, &Kernel);
   if (EFI_ERROR (Status)) { goto Fail; }
+  if (Kernel.Arm64e) {
+    UINT64 Isar1 = READ_SYSREG (id_aa64isar1_el1);
+    BOOLEAN AddressPac = ((Isar1 >> 4) & 0xf) != 0 || ((Isar1 >> 8) & 0xf) != 0;
+    BOOLEAN GenericPac = ((Isar1 >> 24) & 0xf) != 0 || ((Isar1 >> 28) & 0xf) != 0;
+    Stage = L"ARM64E PAC ISA";
+    Print (L"DARWINBOOT24: arm64e native PAC ISA ISAR1=%lx; key access is qualified by XNU\n", Isar1);
+    if (!AddressPac || !GenericPac) { Status = EFI_UNSUPPORTED; goto Fail; }
+  }
   Length = StrSize (Request->KernelPath);
   TreePath = AllocatePool (Length + 11 * sizeof (CHAR16));
   if (TreePath == NULL) { Status = EFI_OUT_OF_RESOURCES; goto Fail; }
@@ -706,6 +762,7 @@ Boot (
   RamdiskOffset = MAX_UINTN;
   TrustCacheOffset = MAX_UINTN;
   mAudioDmaOffset = MAX_UINTN;
+  mModemMetadataOffset = mRmtfsDmaOffset = MAX_UINTN;
   mRamWireOffset = mRamAllowedOffset = MAX_UINTN;
   mRamAllowedCount = 0;
   WindowSize = 0;
@@ -755,6 +812,22 @@ Boot (
       FlushRange (AudioAddress, 65536);
     }
   }
+  // cape-modem-pas requires its authentication metadata below4GiB. This
+  // is a distinct real UEFI allocation, never an audio/USB buffer or NV data.
+  if (mModemMetadataOffset != MAX_UINTN) {
+    ModemMetadataAddress = 0xffffffffULL;
+    Status = gBS->AllocatePages (AllocateMaxAddress, EfiReservedMemoryType, 16, &ModemMetadataAddress);
+    if (EFI_ERROR (Status)) { ModemMetadataAddress = 0; }
+    else { ZeroMem ((VOID *)(UINTN)ModemMetadataAddress, 65536); FlushRange (ModemMetadataAddress, 65536); }
+  }
+  // RMTFS IOVEC addresses are32-bit. Allocate a distinct640-page lease
+  // before XNU's high-memory VM starts; never borrow audio/USB/metadata.
+  if (mRmtfsDmaOffset != MAX_UINTN) {
+    RmtfsAddress = 0xffffffffULL;
+    Status = gBS->AllocatePages (AllocateMaxAddress, EfiReservedMemoryType, 640, &RmtfsAddress);
+    if (EFI_ERROR (Status)) { RmtfsAddress = 0; }
+    else { ZeroMem ((VOID *)(UINTN)RmtfsAddress, 0x280000); FlushRange (RmtfsAddress, 0x280000); }
+  }
   ArgsAddress = ALIGN_VALUE (Address + Kernel.End - Kernel.Base, SIZE_16KB);
   if (mUsbDmaOffset != MAX_UINTN) {
     UsbAddress=0xffffffffULL;
@@ -801,6 +874,14 @@ Boot (
   if (mAudioDmaOffset != MAX_UINTN) {
     WriteUnaligned64 ((UINT64 *)(UINTN)(TreeAddress + mAudioDmaOffset), AudioAddress);
     WriteUnaligned64 ((UINT64 *)(UINTN)(TreeAddress + mAudioDmaOffset + 8), AudioAddress ? 65536 : 0);
+  }
+  if (mModemMetadataOffset != MAX_UINTN) {
+    WriteUnaligned64 ((UINT64 *)(UINTN)(TreeAddress + mModemMetadataOffset), ModemMetadataAddress);
+    WriteUnaligned64 ((UINT64 *)(UINTN)(TreeAddress + mModemMetadataOffset + 8), ModemMetadataAddress ? 65536 : 0);
+  }
+  if (mRmtfsDmaOffset != MAX_UINTN) {
+    WriteUnaligned64 ((UINT64 *)(UINTN)(TreeAddress + mRmtfsDmaOffset), RmtfsAddress);
+    WriteUnaligned64 ((UINT64 *)(UINTN)(TreeAddress + mRmtfsDmaOffset + 8), RmtfsAddress ? 0x280000 : 0);
   }
   if (mUsbDmaOffset != MAX_UINTN) {
     WriteUnaligned64((UINT64 *)(UINTN)(TreeAddress+mUsbDmaOffset),UsbAddress);
@@ -920,6 +1001,8 @@ Fail:
     gBS->FreePages (Owned[Index].Start, EFI_SIZE_TO_PAGES (Owned[Index].Size));
   }
   if (AudioAddress != 0) { gBS->FreePages (AudioAddress, 16); }
+  if (ModemMetadataAddress != 0) { gBS->FreePages (ModemMetadataAddress, 16); }
+  if (RmtfsAddress != 0) { gBS->FreePages (RmtfsAddress, 640); }
   if (UsbAddress != 0) { gBS->FreePages (UsbAddress, 8); }
   if (Address != 0) { gBS->FreePages (Address, EFI_SIZE_TO_PAGES (WindowSize)); }
   Print (L"DARWINBOOT: boot refused: %r; firmware retained\n", Status);

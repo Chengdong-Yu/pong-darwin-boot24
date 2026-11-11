@@ -1,24 +1,8 @@
-# DarwinBoot24
+# DarwinBoot24 for Pong
 
-面向 XNU 11417.140.69 / Darwin 24 的 UEFI XNU 加载器：解析 Mach-O、组 `boot_args`，并在带 PONGFAT1 ramdisk 的情况下交接内核。
-
-## 适配硬件
-
-- Nothing Phone (2)（Pong / SM8475）的 uefi-pong 固件环境，UEFI 侧为 Mu-Silicium
-- 额外 4 GiB 以上 DRAM 的租借：按 ADT 报告的物理区间逐个申请回写常规内存页，每块不超过 1 GiB 并合并相邻区间
-
-## 仓库关系
-
-上游 [UniXNU/DarwinBoot](https://github.com/UniXNU/DarwinBoot) 的 Darwin 24 变体：`boot_args` 命令行 1024 字节、`memSizeActual` 在 0x478、结构 0x480，并新增 `UsbOwnership.h` 把 UEFI 保留的 USB DMA 交给内核。
-
-## 说明
-
-- 不写任何固件或设备分区；`pong_ram_banks=0` 只申请 4 GiB 引导窗口。
-- 编译：`scripts/build-darwinboot24-macos.py`，在独立工作区构建并把 EFI 产物、日志与构建记录写到 `mac-build/darwinboot24/`。有 `Test/` 目录。
-
-构建、接口与组件目录见 [UniXNU 组件目录](https://unixnu.com/reference/components)，板级输入与编译入口在 [UniXNU-pong](https://github.com/Chengdong-Yu/UniXNU-pong)。
-
-## 实现细节
+This device-local copy targets XNU 11417.140.69 / Darwin 24. Its boot_args command
+line is 1024 bytes, memSizeActual is at 0x478, and the structure is 0x480 bytes.
+The older shared DarwinBoot source and saved firmware volume are preserved.
 
 Build with `scripts/build-darwinboot24-macos.py` from the device project root.
 The script builds only this loader in an independent workspace and exports the
@@ -61,7 +45,14 @@ cache maintenance, not RAM accounting.
 The Darwin 24 build has handed off to the native Pong kernel on hardware:
 saved cpu2/apfs3 logs reached GICv3/CNTV, UFS, APFS and the matching 22H374
 userland helper. This does not qualify the iPadOS 18 UI or Metal interfaces.
-Boot evidence is kept under the project's ignored `out/ipados18/logs/` directory.
+Current captures are kept under `/Volumes/PongDev/logs/pong/`.
+
+The native22G100 target uses the iPhone17,2 / D94AP profile and the independently
+built arm64e fileset loader. It accepts `MH_FILESET`, loads root mappings once,
+and obtains the kernel entry from the collection. The new packager refuses to
+write a candidate while any selected kext import remains unresolved. Compilation
+of the loader is complete; the22G100 handoff and per-CPU PAC key qualification
+have not yet been observed on the device.
 
 The copied Test fixtures are retained as reference material; their memory-size
 offset was updated for Darwin 24. They are excluded from this standalone build

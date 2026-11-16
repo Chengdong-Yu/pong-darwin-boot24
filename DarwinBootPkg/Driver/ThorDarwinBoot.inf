@@ -1,0 +1,56 @@
+## SPDX-License-Identifier: BSD-2-Clause-Patent
+[Defines]
+  INF_VERSION = 0x00010019
+  BASE_NAME = DarwinBoot24Thor
+  FILE_GUID = 1C4AB02D-5AB1-5EC9-AEAF-5A6B14ACFD34
+  MODULE_TYPE = UEFI_DRIVER
+  VERSION_STRING = 0.1
+  ENTRY_POINT = DarwinBootEntry
+
+[Sources]
+  ThorDarwinBoot.c
+  PackedRamdisk.h
+  UsbOwnership.h
+  ThorMemoryAudit.h
+  ThorBankBFdtPolicy.h
+  ThorPrivateHighRam.h
+  ThorFullRamAccess.h
+  ThorHighTranslation.h
+  ThorOwnedLowRam.h
+  BootArgs.h
+  BootVideo.h
+  DiagFont.h
+  Entry.S
+  ThorEntry.S
+
+[Packages]
+  MdePkg/MdePkg.dec
+  UniXNUPkg/UniXNUPkg.dec
+  QcomPkg/QcomPkg.dec
+  SiliciumPkg/SiliciumPkg.dec
+
+[LibraryClasses]
+  BaseLib
+  BaseMemoryLib
+  DebugLib
+  DxeServicesTableLib
+  FdtLib
+  HobLib
+  MemoryAllocationLib
+  PrintLib
+  UefiBootServicesTableLib
+  UefiDriverEntryPoint
+  UefiLib
+
+[Protocols]
+  gUniXNULoaderProtocolGuid ## PRODUCES
+  gEfiSimpleFileSystemProtocolGuid ## CONSUMES
+  gEfiLoadedImageProtocolGuid ## CONSUMES
+  gEfiGraphicsOutputProtocolGuid ## CONSUMES
+  gEfiCpuArchProtocolGuid ## SOMETIMES_CONSUMES
+  gEfiUsbFunctionIoProtocolGuid ## CONSUMES
+  gEfiSMEMProtocolGuid ## SOMETIMES_CONSUMES
+
+[Guids]
+  gEfiFileInfoGuid
+  gSiliciumEntryArgHobGuid

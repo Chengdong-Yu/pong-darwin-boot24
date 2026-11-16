@@ -66,3 +66,16 @@ Boot evidence is kept under the project's ignored `out/ipados18/logs/` directory
 The copied Test fixtures are retained as reference material; their memory-size
 offset was updated for Darwin 24. They are excluded from this standalone build
 and were not rerun in this Mac round.
+
+## Thor firmware variant
+
+The Xiaomi 12S Ultra (Thor, SM8475) platform selects
+`DarwinBootPkg/Driver/ThorDarwinBoot.inf` in its firmware DSC and FDF.
+It publishes the same UniXNU loader protocol and Darwin 24 boot argument ABI.
+The original `DarwinBoot.inf` remains the selection for the Pong build.
+
+The Thor driver clips its initial high-memory allocation at the firmware HYP
+boundary. It qualifies additional DRAM using Thor's resident FDT and actual
+firmware ownership before extending the Darwin RAM contract. It also handles
+an optional boot ADT placeholder for a separately leased scanout buffer. Rebuild
+with the Thor board firmware configuration and the matching Thor OS profile.
